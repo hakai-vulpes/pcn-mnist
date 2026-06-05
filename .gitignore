@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Datasets (downloaded on demand by torchvision)
+data/
+
+# Experiment outputs
+outputs/
+runs/
+*.pt
+*.png
+!docs/**/*.png
