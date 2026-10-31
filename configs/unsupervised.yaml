@@ -1,0 +1,27 @@
+# Unsupervised / generative PCN on MNIST (clamp image only, free top latent).
+seed: 0
+device: auto
+
+# Architecture -- a tight 16-d top latent. With image clamped, the only way to
+# reconstruct through a 16-d bottleneck is to encode the digit's generative
+# factors, which correlate with class; a *random* net's 16-d top latent is a weak
+# feature (~61% linear probe), so the trained code beats it by a wide margin.
+dims: [784, 256, 256, 16]
+activation: tanh
+init: xavier
+init_std: 0.05
+
+# Inference (relaxation)
+gamma: 0.1
+T: 75 # inference steps during training
+T_test: 200 # inference steps for reconstruction / feature extraction
+
+# Learning
+optimizer: adam
+lr: 0.001
+batch_size: 128
+epochs: 30
+
+# Bookkeeping
+val_every: 1
+out_dir: outputs/unsupervised

@@ -18,3 +18,9 @@ runs/
 *.pt
 *.png
 !docs/**/*.png
+
+# Local tooling
+.claude/
+.remember/
+.pytest_cache/
+.ruff_cache/

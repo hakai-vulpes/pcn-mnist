@@ -16,10 +16,12 @@ from pcn.functional import energy
 from pcn.model import PCN
 
 
-def _make_model_and_states(seed=0, activation="tanh"):
+def _make_model_and_states(seed=0, activation="tanh", direction="generative"):
     torch.manual_seed(seed)
     dims = [12, 8, 6, 4]
-    model = PCN(dims=dims, activation=activation, init_std=0.3, seed=seed)
+    model = PCN(
+        dims=dims, activation=activation, init_std=0.3, seed=seed, direction=direction
+    )
     batch = 5
     # Random value states for every layer 0..L.
     xs = [torch.randn(batch, d, dtype=torch.float64) for d in dims]
@@ -81,3 +83,36 @@ def test_relu_dF_dx_matches_autograd():
         assert torch.allclose(
             manual_gx[l], gx[l], atol=1e-8, rtol=1e-6
         ), f"relu dF/dx mismatch at layer {l}"
+
+
+# --- Discriminative direction (predictions flow input -> output) ------------ #
+# The same energy/gradient identities must hold when the network predicts
+# bottom-up (the "PC approximates backprop" orientation used for classification).
+
+
+def test_discriminative_dF_dx_matches_autograd():
+    model, xs = _make_model_and_states(direction="discriminative")
+    _, errors = model.predict(xs)
+    manual_gx = model.grad_x(xs, errors)
+    gx, _, _ = _autograd_grads(model, xs)
+    for l in range(len(xs)):
+        assert torch.allclose(manual_gx[l], gx[l], atol=1e-8, rtol=1e-6), (
+            f"discriminative dF/dx mismatch at layer {l}: max abs diff "
+            f"{(manual_gx[l] - gx[l]).abs().max().item()}"
+        )
+
+
+def test_discriminative_dF_dW_db_matches_autograd():
+    model, xs = _make_model_and_states(direction="discriminative")
+    _, errors = model.predict(xs)
+    manual_gW, manual_gb = model.grad_w(xs, errors)
+    _, gW, gb = _autograd_grads(model, xs)
+    for l in range(len(model.W)):
+        assert torch.allclose(manual_gW[l], gW[l], atol=1e-8, rtol=1e-6), (
+            f"discriminative dF/dW mismatch at layer {l}: max abs diff "
+            f"{(manual_gW[l] - gW[l]).abs().max().item()}"
+        )
+        assert torch.allclose(manual_gb[l], gb[l], atol=1e-8, rtol=1e-6), (
+            f"discriminative dF/db mismatch at layer {l}: max abs diff "
+            f"{(manual_gb[l] - gb[l]).abs().max().item()}"
+        )

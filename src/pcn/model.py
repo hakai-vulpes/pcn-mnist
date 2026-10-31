@@ -1,29 +1,43 @@
 """The Predictive Coding Network.
 
 Indexing convention (fixed everywhere): layers ``l = 0 .. L`` where layer 0 is
-the data/image end and layer L is the abstract/label end. The layer *above*
-predicts the layer *below*::
+the data/image end and layer L is the abstract/label end. There is one weight
+matrix ``W[i]`` and bias ``b[i]`` per adjacent pair of layers (``i = 0 .. L-1``).
 
-    mu[l]  = W[l] @ f(x[l+1]) + b[l]        for l = 0 .. L-1   (column-vector form)
-    eps[l] = x[l] - mu[l]
+What differs between tasks is the *prediction direction* -- which neighbour
+predicts which. We support both, because the network is discriminative *and*
+generative (Bogacz 2017; Whittington & Bogacz 2017):
 
-In batched row-vector form (states are ``[B, dim]``) this is::
+* ``direction="generative"`` -- the layer *above* predicts the layer *below*
+  (top-down). Connection ``i`` predicts the lower layer ``i`` from the upper
+  layer ``i+1``. ``W[i]`` has shape ``[dim_i, dim_{i+1}]``. The energy is then
+  dominated by reconstructing the 784-d image, so this is the right orientation
+  for unsupervised representation learning, reconstruction, and class-conditioned
+  generation (Phase 5).
 
-    mu[l]  = f(x[l+1]) @ W[l].T + b[l]
-    eps[l] = x[l] - mu[l]
+* ``direction="discriminative"`` -- the layer *below* predicts the layer *above*
+  (bottom-up). Connection ``i`` predicts the upper layer ``i+1`` from the lower
+  layer ``i``. ``W[i]`` has shape ``[dim_{i+1}, dim_i]``. Now the energy is
+  driven by the *output* (label) error, so inference learning approximates
+  backprop and reaches MLP-level accuracy. This is the orientation for the
+  supervised classifier (Phase 4); a feedforward pass through it is exactly an
+  MLP forward pass, and classification reads out ``argmax(x[L])``.
 
-so ``W[l]`` has shape ``[dim_l, dim_{l+1}]`` and maps layer ``l+1 -> l``.
+Either way each connection ``i`` has a *predictor* layer ``p`` and a *target*
+layer ``t`` with ``mu[i] = f(x[p]) @ W[i].T + b[i]`` and ``eps[i] = x[t] - mu[i]``
+(``W[i]`` has shape ``[dim_t, dim_p]``). The energy is ``F = sum_i 0.5||eps[i]||^2``.
 
-The energy is ``F = sum_l 0.5 ||eps[l]||^2``. Both inference (relaxing free value
-neurons) and learning (updating weights) are gradient *descent* on F, done with
-**manually derived** local updates -- never ``loss.backward()``.
+Both inference (relaxing free value neurons) and learning (updating weights) are
+gradient *descent* on F, done with **manually derived** local updates -- never
+``loss.backward()``.
 
-Manual gradients (verified against autograd in tests/test_gradients.py):
+Manual gradients (verified against autograd in tests/test_gradients.py, for both
+directions). Each connection ``i`` contributes to two value layers::
 
-    dF/dx[l] = eps[l]                                  (own error,  l = 0..L-1)
-             - f'(x[l]) * (eps[l-1] @ W[l-1])          (error below, l = 1..L)
-    dF/dW[l] = - eps[l].T @ f(x[l+1])                  (l = 0..L-1)
-    dF/db[l] = - sum_batch eps[l]                      (l = 0..L-1)
+    dF/dx[t] += eps[i]                          (own error, at the target layer)
+    dF/dx[p] += - f'(x[p]) * (eps[i] @ W[i])    (drive, at the predictor layer)
+    dF/dW[i]  = - eps[i].T @ f(x[p])
+    dF/db[i]  = - sum_batch eps[i]
 """
 
 from __future__ import annotations
@@ -43,31 +57,45 @@ class PCN(nn.Module):
         T: int = 20,
         init_std: float = 0.05,
         init: str = "xavier",
+        direction: str = "generative",
         seed: int | None = None,
         device: str | torch.device | None = None,
     ) -> None:
         super().__init__()
         if len(dims) < 2:
             raise ValueError("need at least 2 layers (input + output)")
+        if direction not in ("generative", "discriminative"):
+            raise ValueError(f"unknown direction {direction!r}")
         self.dims = list(dims)
         self.L = len(dims) - 1  # top layer index; there are L weight matrices
         self.gamma = gamma
         self.T = T
+        self.direction = direction
         self.activation_name = activation
         self.f, self.f_grad = get_activation(activation)
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
 
+        # Per-connection predictor/target layer indices. Generative predicts the
+        # lower layer from the upper one; discriminative predicts the upper from
+        # the lower. Everything else (predict/grad/init) is written against these.
+        if direction == "generative":
+            self._pred = [i + 1 for i in range(self.L)]  # upper predicts ...
+            self._targ = [i for i in range(self.L)]  # ... lower
+        else:  # discriminative
+            self._pred = [i for i in range(self.L)]  # lower predicts ...
+            self._targ = [i + 1 for i in range(self.L)]  # ... upper
+
         if seed is not None:
             gen = torch.Generator().manual_seed(seed)
         else:
             gen = None
 
-        # W[l]: [dim_l, dim_{l+1}], b[l]: [dim_l], for l = 0..L-1.
+        # W[i]: [dim_targ, dim_pred], b[i]: [dim_targ], for i = 0..L-1.
         Ws, bs = [], []
         for l in range(self.L):
-            out_dim, in_dim = dims[l], dims[l + 1]
+            out_dim, in_dim = dims[self._targ[l]], dims[self._pred[l]]
             W = torch.empty(out_dim, in_dim)
             if init == "xavier":
                 bound = (6.0 / (in_dim + out_dim)) ** 0.5
@@ -95,18 +123,20 @@ class PCN(nn.Module):
         Ws: list[torch.Tensor] | None = None,
         bs: list[torch.Tensor] | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Compute ``mu[l]`` and ``eps[l]`` for ``l = 0 .. L-1``.
+        """Compute ``mu[i]`` and ``eps[i]`` for each connection ``i = 0 .. L-1``.
 
-        ``Ws``/``bs`` allow passing external (e.g. autograd-tracked) parameters;
-        otherwise the model's own parameters are used.
+        ``mu[i] = f(x[pred]) @ W[i].T + b[i]`` and ``eps[i] = x[targ] - mu[i]``,
+        where ``pred``/``targ`` depend on ``self.direction``. ``Ws``/``bs`` allow
+        passing external (e.g. autograd-tracked) parameters; otherwise the
+        model's own parameters are used.
         """
         Ws = self.W if Ws is None else Ws
         bs = self.b if bs is None else bs
         mus, errors = [], []
         for l in range(self.L):
-            mu = self.f(xs[l + 1]) @ Ws[l].T + bs[l]
+            mu = self.f(xs[self._pred[l]]) @ Ws[l].T + bs[l]
             mus.append(mu)
-            errors.append(xs[l] - mu)
+            errors.append(xs[self._targ[l]] - mu)
         return mus, errors
 
     # ------------------------------------------------------------------ #
@@ -115,25 +145,26 @@ class PCN(nn.Module):
     def grad_x(
         self, xs: list[torch.Tensor], errors: list[torch.Tensor]
     ) -> list[torch.Tensor]:
-        """dF/dx[l] for every layer ``l = 0 .. L`` (matches autograd of F)."""
-        grads = []
-        for l in range(self.L + 1):
-            g = torch.zeros_like(xs[l])
-            if l < self.L:  # own error term (no error neuron at the top layer L)
-                g = g + errors[l]
-            if l >= 1:  # bottom-up drive from the unexplained error below
-                g = g - self.f_grad(xs[l]) * (errors[l - 1] @ self.W[l - 1])
-            grads.append(g)
+        """dF/dx[l] for every layer ``l = 0 .. L`` (matches autograd of F).
+
+        Each connection ``i`` adds its own error at the target layer and a drive
+        (through ``f'``) at the predictor layer; we accumulate both per layer.
+        """
+        grads = [torch.zeros_like(x) for x in xs]
+        for i in range(self.L):
+            t, p = self._targ[i], self._pred[i]
+            grads[t] = grads[t] + errors[i]  # own error at the target layer
+            grads[p] = grads[p] - self.f_grad(xs[p]) * (errors[i] @ self.W[i])
         return grads
 
     def grad_w(
         self, xs: list[torch.Tensor], errors: list[torch.Tensor]
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """dF/dW[l], dF/db[l] for ``l = 0 .. L-1`` (summed over batch; matches autograd)."""
+        """dF/dW[i], dF/db[i] for ``i = 0 .. L-1`` (summed over batch; matches autograd)."""
         gW, gb = [], []
-        for l in range(self.L):
-            gW.append(-errors[l].T @ self.f(xs[l + 1]))
-            gb.append(-errors[l].sum(dim=0))
+        for i in range(self.L):
+            gW.append(-errors[i].T @ self.f(xs[self._pred[i]]))
+            gb.append(-errors[i].sum(dim=0))
         return gW, gb
 
     # ------------------------------------------------------------------ #
@@ -149,10 +180,15 @@ class PCN(nn.Module):
         """Initialize value states for every layer.
 
         With ``feedforward=True`` and a clamped bottom (image), hidden layers are
-        seeded by a feedforward pass so inference starts near a fixed point and
-        converges in roughly half the steps. The feedforward direction inverts
-        the generative mapping approximately by ``x[l+1] = f(x[l]) @ W[l]`` (the
-        transpose / encoder direction), which is a cheap, good-enough warm start.
+        seeded by a bottom-up pass so inference starts near a fixed point and
+        converges in far fewer steps. The warm start depends on the direction:
+
+        * discriminative -- the *exact* forward prediction
+          ``x[l+1] = f(x[l]) @ W[l].T + b[l]`` (an MLP forward pass), so with
+          only the input clamped the settled state already equals the MLP output.
+        * generative -- a cheap encoder heuristic ``x[l+1] = f(x[l]) @ W[l]``
+          (the transpose direction), which is good enough to warm-start the
+          top-down relaxation.
 
         If a top clamp is supplied it overrides the feedforward value at layer L.
         """
@@ -167,7 +203,10 @@ class PCN(nn.Module):
 
         if feedforward and x_bottom is not None:
             for l in range(self.L):
-                xs[l + 1] = self.f(xs[l]) @ self.W[l]
+                if self.direction == "discriminative":
+                    xs[l + 1] = self.f(xs[l]) @ self.W[l].T + self.b[l]
+                else:
+                    xs[l + 1] = self.f(xs[l]) @ self.W[l]
         else:
             for l in range(1, self.L + 1):
                 xs[l] = torch.zeros(batch_size, self.dims[l], device=dev, dtype=dtype)

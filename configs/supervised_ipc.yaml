@@ -1,0 +1,38 @@
+# Supervised PCN on MNIST with INCREMENTAL predictive coding (iPC).
+#
+# Same network and discriminative orientation as configs/supervised.yaml, but a
+# weight update is taken at every inference step (Salvatori et al. 2022). Standard
+# PC relaxes to equilibrium where the hidden layers explain away the output error,
+# so its weight update only ~0.67-cosine-approximates backprop and tops out around
+# 96% test. iPC follows the relaxation trajectory, approximates backprop far more
+# closely, and reaches MLP-level accuracy.
+seed: 0
+device: auto
+
+# Architecture
+dims: [784, 256, 256, 10]
+# dims: [784, 512, 512, 512, 512, 512, 512, 10]
+activation: tanh
+init: xavier
+init_std: 0.05
+direction: discriminative
+
+# Inference (relaxation) -- fewer steps are needed since each one also learns.
+gamma: 0.1
+T: 20 # inference (= weight) steps during training
+T_test: 100 # inference steps at classification time
+
+# Learning -- iPC takes T times more weight updates per batch, so a smaller LR.
+optimizer: adam
+incremental: true
+lr: 0.0001
+lr_schedule: cosine
+lr_min: 0.000001
+batch_size: 128
+epochs: 40
+target_low: -1.0
+target_high: 1.0
+
+# Bookkeeping
+val_every: 1
+out_dir: outputs/supervised_ipc

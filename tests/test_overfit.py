@@ -28,6 +28,7 @@ def test_overfit_100_examples():
         dims=[784, 256, 256, 10],
         activation="tanh",
         init="xavier",
+        direction="discriminative",  # the supervised classifier orientation
         gamma=0.1,
         T=150,
         init_std=0.05,
@@ -41,3 +42,33 @@ def test_overfit_100_examples():
 
     acc = classify_accuracy(model, loader, device=device, T=300)
     assert acc >= 0.98, f"PCN failed to overfit 100 examples: train acc {acc:.3f}"
+
+
+def test_overfit_100_examples_incremental():
+    """Incremental PC (a weight update every inference step) is a stronger
+    optimizer, so it should memorize the same 100 examples in far fewer epochs."""
+    torch.manual_seed(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    data = load_mnist(download=True)
+    loader = subset_loader(data, n=100, batch_size=100, seed=0)
+
+    model = PCN(
+        dims=[784, 256, 256, 10],
+        activation="tanh",
+        init="xavier",
+        direction="discriminative",
+        gamma=0.1,
+        T=20,
+        init_std=0.05,
+        seed=0,
+        device=device,
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    for _ in range(60):  # far fewer epochs than the standard-PC test above
+        train_supervised_epoch(
+            model, loader, optimizer=opt, device=device, incremental=True
+        )
+
+    acc = classify_accuracy(model, loader, device=device, T=50)
+    assert acc >= 0.98, f"iPC failed to overfit 100 examples: train acc {acc:.3f}"

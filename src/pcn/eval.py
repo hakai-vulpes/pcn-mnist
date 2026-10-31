@@ -13,7 +13,45 @@ from collections.abc import Iterable
 
 import torch
 
+from pcn.functional import energy
 from pcn.model import PCN
+
+
+@torch.no_grad()
+def settle_with_diagnostics(
+    model: PCN,
+    xs: list[torch.Tensor],
+    clamped: set[int],
+    T: int | None = None,
+    gamma: float | None = None,
+) -> tuple[list[torch.Tensor], list[float], dict[int, list[float]]]:
+    """Run inference recording energy and per-layer error norms each step.
+
+    Returns ``(settled_states, energies, error_norms)`` where ``error_norms`` maps
+    each error layer ``l`` to its ``||eps[l]||`` over inference steps. Used for the
+    'settling' visualizations.
+    """
+    T = model.T if T is None else T
+    gamma = model.gamma if gamma is None else gamma
+    xs = [x.clone() for x in xs]
+    energies: list[float] = []
+    norms: dict[int, list[float]] = {l: [] for l in range(model.L)}
+
+    def record() -> None:
+        _, errors = model.predict(xs)
+        energies.append(float(energy(errors)))
+        for l in range(model.L):
+            norms[l].append(float(errors[l].norm()))
+
+    record()
+    for _ in range(T):
+        _, errors = model.predict(xs)
+        grads = model.grad_x(xs, errors)
+        for l in range(model.L + 1):
+            if l not in clamped:
+                xs[l] = xs[l] - gamma * grads[l]
+        record()
+    return xs, energies, norms
 
 
 @torch.no_grad()
@@ -58,6 +96,23 @@ def reconstruct_batch(
     settled, _ = model.infer(xs, clamped={0}, T=T, gamma=gamma)
     mus, _ = model.predict(settled)
     return mus[0]
+
+
+@torch.no_grad()
+def generate_from_labels(
+    model: PCN, targets: torch.Tensor, T: int | None = None, gamma: float | None = None
+) -> torch.Tensor:
+    """Class-conditioned generation: clamp the top one-hot, free the bottom.
+
+    Relaxing with the label clamped and the image end free lets the network
+    "dream" an image for the class. The settled bottom value ``x[0]`` is the
+    generated digit. ``targets`` is a ``[B, num_classes]`` one-hot tensor.
+    """
+    batch = targets.shape[0]
+    # Start hidden/bottom from zeros, then overwrite the top with the clamp.
+    xs = model.init_states(batch, x_bottom=None, x_top=targets, feedforward=False)
+    settled, _ = model.infer(xs, clamped={model.L}, T=T, gamma=gamma)
+    return settled[0]
 
 
 @torch.no_grad()

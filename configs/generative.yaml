@@ -1,0 +1,37 @@
+# Generative PCN on MNIST (top-down predictions; clamp image + label).
+#
+# Same architecture as the supervised classifier but the GENERATIVE direction:
+# the label/latent end predicts the image end top-down, so the energy is the
+# image reconstruction error. Trained with both image and label clamped, this
+# model both reconstructs digits and generates class-conditioned samples (clamp
+# a one-hot at the top, free the image end, and let it "dream" the digit).
+seed: 0
+device: auto
+
+# Architecture
+dims: [784, 256, 256, 10]
+activation: tanh
+init: xavier
+init_std: 0.05
+direction: generative
+
+# Inference (relaxation) -- generative inference needs more steps because the
+# whole image must be reconstructed top-down.
+gamma: 0.1
+T: 75 # inference steps during training
+T_test: 200 # inference steps at reconstruction/generation time
+
+# Learning
+optimizer: adam
+lr: 0.001
+batch_size: 128
+epochs: 30
+target_low: -1.0
+target_high: 1.0
+
+# Linear probe reads a hidden layer (the top is the 10-d label, not a feature).
+probe_layer: 2
+
+# Bookkeeping
+val_every: 1
+out_dir: outputs/generative
